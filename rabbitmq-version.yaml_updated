@@ -1,0 +1,109 @@
+- block:
+
+    - name: Set rabbitmq_container if rabbitmq_services is undefined or empty
+      set_fact:
+        rabbitmq_container: {
+          "image": "{{ rabbitmq_image_full | default('quay.io/openstack.kolla/rabbitmq:3.12.11-ubuntu-jammy') }}",
+          "container_name": "rabbitmq"
+        }
+      when: rabbitmq_services is not defined or rabbitmq_services['rabbitmq'] is not defined
+
+    - name: Set rabbitmq_container from rabbitmq_services
+      set_fact:
+        rabbitmq_container: "{{ rabbitmq_services['rabbitmq'] }}"
+      when: rabbitmq_services is defined and rabbitmq_services['rabbitmq'] is defined
+
+    - name: Get container facts
+      become: true
+      kolla_container_facts:
+        container_engine: "{{ kolla_container_engine }}"
+        name:
+          - "{{ rabbitmq_container.container_name }}"
+      register: container_facts
+
+    - block:
+
+        - name: Get current RabbitMQ version
+          become: true
+          command: "{{ kolla_container_engine }} exec {{ rabbitmq_container.container_name }} rabbitmqctl --version"
+          register: rabbitmq_version_current
+          changed_when: false
+          failed_when: rabbitmq_version_current.stdout is not defined
+
+        - name: Get new RabbitMQ version from target image
+          become: true
+          kolla_container:
+            action: "start_container"
+            command: "rabbitmqctl --version"
+            common_options: "{{ docker_common_options }}"
+            container_engine: "{{ kolla_container_engine }}"
+            detach: false
+            environment:
+              KOLLA_CONFIG_STRATEGY: "{{ config_strategy }}"
+            image: "{{ rabbitmq_container.image }}"
+            name: "rabbitmq_version_check"
+            restart_policy: oneshot
+            volumes: "{{ rabbitmq_default_volumes + rabbitmq_extra_volumes }}"
+          register: rabbitmq_version_new
+          failed_when: rabbitmq_version_new.stdout is not defined
+          check_mode: false
+
+        - name: Debug version output
+          debug:
+            msg:
+              - "Current RabbitMQ version: {{ rabbitmq_version_current.stdout | default('undefined') }}"
+              - "New RabbitMQ version: {{ rabbitmq_version_new.stdout | default('undefined') }}"
+
+        - name: Fail if version output is missing
+          fail:
+            msg: >
+              Could not determine current or new RabbitMQ version.
+              current: {{ rabbitmq_version_current.stdout | default('undefined') }},
+              new: {{ rabbitmq_version_new.stdout | default('undefined') }}
+          when: >
+            rabbitmq_version_current is not defined or
+            rabbitmq_version_current.stdout is not defined or
+            rabbitmq_version_new is not defined or
+            rabbitmq_version_new.stdout is not defined
+
+        - name: Set version facts
+          set_fact:
+            current_version: "{{ rabbitmq_version_current.stdout | trim }}"
+            new_version: "{{ rabbitmq_version_new.stdout | trim }}"
+            current_version_major: "{{ (rabbitmq_version_current.stdout | trim).split('.')[0] | int }}"
+            current_version_minor: "{{ (rabbitmq_version_current.stdout | trim).split('.')[1] | int }}"
+            new_version_major: "{{ (rabbitmq_version_new.stdout | trim).split('.')[0] | int }}"
+            new_version_minor: "{{ (rabbitmq_version_new.stdout | trim).split('.')[1] | int }}"
+            upgrade_version: >-
+              {{ '4.0' if (rabbitmq_version_current.stdout | trim).startswith('3.13') else
+                 ((rabbitmq_version_current.stdout | trim).split('.')[0] | int) ~ '.' ~
+                 (((rabbitmq_version_current.stdout | trim).split('.')[1] | int) + 1) }}
+
+        - name: Check if running RabbitMQ is at most one version behind
+          assert:
+            that:
+              - >
+                (current_version_major == new_version_major and
+                 (new_version_minor | int - current_version_minor | int) <= 1)
+                or (new_version | float == 4.0 and current_version | float == 3.13)
+            fail_msg: >
+              Looks like you're trying to run a skip-release upgrade!
+              RabbitMQ must be at most one version behind the target release version ({{ new_version }}) to run this upgrade.
+              You are running {{ current_version }}.
+              Please first upgrade to {{ upgrade_version }} using:
+              kolla-ansible -i multinode rabbitmq-upgrade -e rabbitmq_version_suffix={{ upgrade_version }}
+
+        - name: Catch when RabbitMQ is being downgraded
+          assert:
+            that:
+              - current_version is version(new_version, 'le', version_type='semver')
+            fail_msg: >
+              You're about to downgrade RabbitMQ from {{ current_version }} to {{ new_version }}.
+              If you're sure, use `--skip-tags rabbitmq-version-check`. Otherwise, upgrade properly.
+
+      when: container_facts[rabbitmq_container.container_name] is defined
+
+  delegate_to: "{{ groups[role_rabbitmq_groups] | first }}"
+  run_once: true
+  tags: rabbitmq-version-check
+

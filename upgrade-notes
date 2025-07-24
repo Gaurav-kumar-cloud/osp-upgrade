@@ -1,0 +1,121 @@
+#######Kolla-Ansible Upgrade & Reconfiguration Guide (2023.2)######
+This document outlines the steps to back up configuration, update Kolla-Ansible, regenerate passwords, and perform an upgrade on a multinode OpenStack deployment.
+
+#########Backup Existing Kolla Configuration############
+cp -r /etc/kolla kolla.bak
+
+#########Generate New Passwords & Merge with Existing#########
+cp /etc/kolla/passwords.yml passwords.yml.old
+cp /opt/osp/share/kolla-ansible/etc_examples/kolla/passwords.yml passwords.yml.new
+kolla-genpwd -p passwords.yml.new
+kolla-mergepwd --old passwords.yml.old --new passwords.yml.new --final /etc/kolla/passwords.yml
+
+
+#########Upgrade Kolla-Ansible to 2024.1#########
+pip3 install --upgrade git+https://opendev.org/openstack/kolla-ansible@stable/2024.1
+
+######### Install Required Dependencies###########
+kolla-ansible install-deps
+
+
+##########error on run genconfig edit globals file#########
+Note-
+   remove the 'ceph'  form the ceph keyrings.
+
+
+###error at stage of precheckes during upgrade to 2024.2######
+TASK [cinder : Check if cinder_cluster_name is configured for HA configurations] 
+   solution is -  edit globals.yaml(add this line)
+  
+   cinder_cluster_name: cinder-ha-cluster                               (add this entry in globals.yml file)
+ 
+
+#######Regenerate Configuration Files########
+kolla-ansible -i multinode genconfig
+
+#########add in globals.yml:########
+om_enable_rabbitmq_quorum_queues: false
+om_enable_rabbitmq_high_availability: true
+
+#########Apply the HA Policy inside the RabbitMQ container:##########
+docker exec -it rabbitmq bash
+rabbitmqctl set_policy ha-all ".*" '{"ha-mode": "all"}' --priority 1
+rabbitmqctl list_policies
+exit
+
+########Pull Updated Docker Images##########
+kolla-ansible -i multinode pull
+
+#################Stop Targeted OpenStack Services##########(optional)
+kolla-ansible -i multinode stop --tags nova,neutron,keystone,glance,swift,cinder,heat,placement,octavia,barbican,magnum,designate,masakari,trove --yes-i-really-really-mean-it
+
+###########Reset RabbitMQ State#############
+kolla-ansible -i multinode rabbitmq-reset-state
+
+#######upgrade rabbitmq from 2023.1 to 2024.1###############
+####edit the file version-check.yml#####
+vi /opt/osp/share/kolla-ansible/ansible/roles/rabbitmq/tasks/version-check.yml
+
+update this file beacuse here rabbitmq upgrade give error like beacuse we have to first upgrade rabbitmq version from 3.11.x - 3.12.x - 3.13.x we can't directly jump from 3.11.x to 3.13.x. 
+    
+TASK [rabbitmq : Check if running RabbitMQ is at most one version behind] *************************************************************************************************************************************************************************************
+fatal: [controller1]: FAILED! => {"msg": "The task includes an option with an undefined variable. The error was: 'dict object' has no attribute 'stdout'. 'dict object' has no attribute 'stdout'\n\nThe error appears to be in '/opt/osp/share/kolla-ansible/ansible/roles/rabbitmq/tasks/version-check.yml': line 43, column 27, but may\nbe elsewhere in the file depending on the exact syntax problem.\n\nThe offending line appears to be:\n\n        # upgrade_version = 3.12\n                          ^ here\n\nThere appears to be both 'k=v' shorthand syntax and YAML in this task. Only one syntax may be used.\n"}
+
+   so and edit /etc/kolla/globals.yml add a entry like- 
+     #rabbitmq_image_full: "quay.io/openstack.kolla/rabbitmq:2023.2-ubuntu-jammy"    (add this when upgrade rabbitmq from version 3.11.x to 3.12.x after upgrade successfully commant this)
+     rabbitmq_image_full: "quay.io/openstack.kolla/rabbitmq:2024.1-ubuntu-jammy"     (add this when upgrade rabbitmq from version 3.12.x to 3.13.x) 
+
+######## upgrade rabbitmq #################
+kolla-ansible -i multinode rabbitmq-upgrade   -e rabbitmq_version_suffix=3.11   -e rabbitmq_image_full=quay.io/openstack.kolla/rabbitmq:2023.2-ubuntu-jammy
+kolla-ansible -i multinode rabbitmq-upgrade   -e rabbitmq_version_suffix=3.12   -e rabbitmq_image_full=quay.io/openstack.kolla/rabbitmq:2024.1-ubuntu-jammy
+
+#############Reconfigure Core Services#############
+kolla-ansible -i multinode reconfigure --tags mariadb,rabbitmq,keystone
+kolla-ansible -i multinode reconfigure --tags nova,neutron,glance,cinder,heat,placement,octavia,magnum,designate,masakari,trove,grafana,barbican,swift
+
+###########Run Prechecks#############
+kolla-ansible -i multinode prechecks
+
+############Upgrade Controllers#############
+kolla-ansible -i multinode upgrade --limit controller1,controller2,controller3
+
+############Upgrade computes################
+kolla-ansible -i multinode upgrade --limit compute1
+
+
+
+
+
+
+
+
+###########rabbitmq upgrade from 2024.1 to 2024.2 release##########
+1)edit file
+  cat /opt/osp/share/kolla-ansible/ansible/roles/rabbitmq/tasks/version-check.yml
+  
+2)pull latest docker rabbitmq image
+  docker pull quay.io/openstack.kolla/rabbitmq:2024.2-ubuntu-noble
+  
+3) edit /etc/kolla/gloabs.yml  (add this image)
+    rabbitmq_image_full: "quay.io/openstack.kolla/rabbitmq:2024.2-ubuntu-jammy"    
+    
+4) create directory for rabbitmq_upgrade.yml file
+  - mkdir /usr/share/kolla-ansible/ansible/    
+  - touch rabbitmq-upgrade.yml
+  
+5) Download the playbook manually:
+  wget https://raw.githubusercontent.com/openstack/kolla-ansible/master/ansible/rabbitmq-upgrade.yml -O /usr/share/kolla-ansible/ansible/rabbitmq-upgrade.yml
+
+6) Clone the correct version of Kolla-Ansible
+  If you're using OpenStack 2024.2 (Caracal), then clone that branch:    
+  
+ - git clone -b stable/2024.2 https://opendev.org/openstack/kolla-ansible.git /opt/kolla-ansible
+
+7) Run the playbook using the full path
+   ansible-playbook -i multinode \
+  -e @/etc/kolla/globals.yml \
+  -e @/etc/kolla/passwords.yml \
+  -e rabbitmq_version_suffix=3.14 \
+  -e rabbitmq_image_full=quay.io/openstack.kolla/rabbitmq:2024.2-ubuntu-noble \
+  /opt/kolla-ansible/ansible/rabbitmq-upgrade.yml 
+  

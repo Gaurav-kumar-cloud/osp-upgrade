@@ -1,0 +1,84 @@
+---
+- block:
+    - name: Get container facts
+      become: true
+      kolla_container_facts:
+        action: get_containers
+        container_engine: "{{ kolla_container_engine }}"
+        name:
+          - "{{ service.container_name }}"
+      register: container_facts
+
+    - block:
+
+        - name: Get current RabbitMQ version
+          become: true
+          command: "{{ kolla_container_engine }} exec {{ service.container_name }} rabbitmqctl --version"
+          register: rabbitmq_version_current
+          changed_when: false
+
+        - name: Fail if current RabbitMQ version is undefined
+          fail:
+            msg: "Could not get current RabbitMQ version"
+          when: rabbitmq_version_current is not defined or rabbitmq_version_current.stdout is not defined
+
+        - name: Get new RabbitMQ version
+          become: true
+          vars:
+            rabbitmq_container: "{{ rabbitmq_services['rabbitmq'] }}"
+          kolla_container:
+            action: "start_container"
+            command: "rabbitmqctl --version"
+            common_options: "{{ docker_common_options }}"
+            container_engine: "{{ kolla_container_engine }}"
+            detach: false
+            environment:
+              KOLLA_CONFIG_STRATEGY: "{{ config_strategy }}"
+            image: "{{ rabbitmq_container.image }}"
+            name: "rabbitmq_version_check"
+            restart_policy: oneshot
+            volumes: "{{ rabbitmq_default_volumes + rabbitmq_extra_volumes }}"
+          register: rabbitmq_version_new
+          failed_when: rabbitmq_version_new.stdout is not defined
+          check_mode: false
+
+        - name: Set version facts
+          set_fact:
+            current_version: "{{ rabbitmq_version_current.stdout | trim }}"
+            new_version: "{{ rabbitmq_version_new.stdout | trim }}"
+            current_version_major: "{{ current_version.split('.')[0] | int }}"
+            current_version_minor: "{{ current_version.split('.')[1] | int }}"
+            new_version_major: "{{ new_version.split('.')[0] | int }}"
+            new_version_minor: "{{ new_version.split('.')[1] | int }}"
+            upgrade_version: "{{ '4.0' if current_version == '3.13' else current_version_major ~ '.' ~ ((current_version_minor | int) + 1) }}"
+
+        - name: Check if running RabbitMQ is at most one version behind
+          assert:
+            that:
+              - (current_version_major == new_version_major and (new_version_minor | int - current_version_minor | int) <= 1)
+              - (new_version | float == 4.0 and current_version | float == 3.13) or true  # this line avoids fail if not matching float case
+            fail_msg: >
+              Looks like you're trying to run a skip-release upgrade!
+              RabbitMQ must be at most one version behind the target release version ({{ new_version }}) to run this upgrade.
+              You are running {{ current_version }}.
+              Please first upgrade to {{ upgrade_version }} with the command ``kolla-ansible rabbitmq-upgrade {{ upgrade_version }}``.
+              See these docs for more details: https://docs.openstack.org/kolla-ansible/latest/reference/message-queues/rabbitmq.html#slurp
+
+        - name: Catch when RabbitMQ is being downgraded
+          assert:
+            that: current_version is version(new_version, 'le', version_type='semver')
+            fail_msg: >
+              Looks like you're about to downgrade RabbitMQ from version {{ current_version }} to version {{ new_version }}.
+              If you're absolutely certain you want to do this, please skip the tag `rabbitmq-version-check`.
+              Otherwise, see these docs for how to pin the version of RabbitMQ:
+              https://docs.openstack.org/kolla-ansible/latest/reference/message-queues/rabbitmq.html#rabbitmq-versions
+
+      when: container_facts[service.container_name] is defined
+
+  delegate_to: "{{ groups[role_rabbitmq_groups] | first }}"
+  run_once: true
+  tags: rabbitmq-version-check
+  vars:
+    service_name: "rabbitmq"
+    service: "{{ rabbitmq_services[service_name] }}"
+
